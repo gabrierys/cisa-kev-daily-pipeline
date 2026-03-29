@@ -9,26 +9,25 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
 
 # Jupyter
 .ipynb_checkpoints/
 
 # Local caches
 .cache_nvd/
+.cache_mpl/
 
 # OS/editor
 .DS_Store
 .vscode/
 
 # Generated artifacts
-kev_raw.csv
-threats_daily_events.csv
-threats_daily_counts.csv
-threats_by_vendor.csv
-threats_by_product.csv
-summary.json
-enrich_nvd.csv
-enrich_epss.csv
-threats_daily_enriched.csv
-plots/*.html
-plots/*.png
+artifacts/
