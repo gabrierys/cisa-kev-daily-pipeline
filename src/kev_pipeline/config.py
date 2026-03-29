@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Dict
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+@dataclass
+class PipelineConfig:
+    pipeline_mode: str = "kev"
+    run_nvd: bool = False
+    run_epss: bool = False
+    out_dir: Path = Path("artifacts/current")
+    plots_dir: Path = Path("artifacts/plots")
+    snapshots_dir: Path = Path("artifacts/snapshots")
+    deltas_dir: Path = Path("artifacts/deltas")
+    kev_csv_url: str = "https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
+    nvd_api_url: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    epss_api_url: str = "https://api.first.org/data/v1/epss"
+    nvd_api_key: str = ""
+    user_agent: str = "kev-pipeline/1.0"
+    nvd_delay_seconds: float = 0.4
+    epss_chunk_size: int = 100
+    nvd_max_items: int | None = None
+    generate_plots: bool = True
+    snapshot_date: date = field(default_factory=_utc_today)
+
+    def __post_init__(self) -> None:
+        if self.pipeline_mode not in {"kev", "full"}:
+            raise ValueError("pipeline_mode must be 'kev' or 'full'.")
+        if self.pipeline_mode == "kev" and self.run_nvd:
+            self.run_nvd = False
+        self.out_dir = Path(self.out_dir)
+        self.plots_dir = Path(self.plots_dir)
+        self.snapshots_dir = Path(self.snapshots_dir)
+        self.deltas_dir = Path(self.deltas_dir)
+
+    @property
+    def files(self) -> Dict[str, Path]:
+        return {
+            "kev_raw": self.out_dir / "kev_raw.csv",
+            "threats_daily_events": self.out_dir / "threats_daily_events.csv",
+            "threats_daily_counts": self.out_dir / "threats_daily_counts.csv",
+            "threats_by_vendor": self.out_dir / "threats_by_vendor.csv",
+            "threats_by_product": self.out_dir / "threats_by_product.csv",
+            "enrich_nvd": self.out_dir / "enrich_nvd.csv",
+            "enrich_epss": self.out_dir / "enrich_epss.csv",
+            "threats_daily_enriched": self.out_dir / "threats_daily_enriched.csv",
+            "summary": self.out_dir / "summary.json",
+        }
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.snapshots_dir / self.snapshot_date.isoformat()
+
+    @property
+    def delta_dir(self) -> Path:
+        return self.deltas_dir / self.snapshot_date.isoformat()
