@@ -31,6 +31,7 @@ Enriquecimentos opcionais:
 Histórico local:
 
 - `artifacts/snapshots/YYYY-MM-DD/`: snapshot completo da execução
+- `artifacts/snapshots/YYYY-MM-DD/plots/`: gráficos da execução, quando habilitados
 - `artifacts/deltas/YYYY-MM-DD/new_cves_today.csv`: CVEs novos em relação ao snapshot anterior
 - `artifacts/deltas/YYYY-MM-DD/new_urgent_today.csv`: novos CVEs urgentes
 - `artifacts/deltas/YYYY-MM-DD/new_ransomware_today.csv`: novos CVEs com `ransomware_flag=1`
@@ -118,7 +119,7 @@ Campos derivados de `notes`:
 
 ## Opções úteis de CLI
 
-- `--skip-plots`: pula geração de HTML/PNG e evita criar a pasta de plots
+- `--skip-plots`: pula geração de HTML/PNG
 - `--snapshot-date YYYY-MM-DD`: força a data do snapshot local
 - `--out-dir PATH`: muda a pasta de saídas canônicas
 - `--snapshots-dir PATH`: muda a pasta do histórico local
@@ -141,7 +142,8 @@ Campos derivados de `notes`:
    Se o pacote estiver instalado no ambiente, o equivalente é `kev-pipeline --mode kev`.
 2. Consulte `artifacts/current/summary.json`.
 3. Consulte `artifacts/snapshots/<data>/`.
-4. Consulte `artifacts/deltas/<data>/` para identificar o que entrou desde o snapshot anterior.
+4. Consulte `artifacts/snapshots/<data>/plots/` se a execução tiver sido feita com gráficos habilitados.
+5. Consulte `artifacts/deltas/<data>/` para identificar o que entrou desde o snapshot anterior.
 
 Uso exploratório:
 
