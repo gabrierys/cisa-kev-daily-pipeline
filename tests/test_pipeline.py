@@ -99,9 +99,9 @@ class ConfigTests(unittest.TestCase):
         config = PipelineConfig()
 
         self.assertEqual(config.out_dir, Path("artifacts/current"))
-        self.assertEqual(config.plots_dir, Path("artifacts/plots"))
         self.assertEqual(config.snapshots_dir, Path("artifacts/snapshots"))
         self.assertEqual(config.deltas_dir, Path("artifacts/deltas"))
+        self.assertEqual(config.snapshot_plots_dir, Path("artifacts/snapshots") / config.snapshot_date.isoformat() / "plots")
 
 
 class RunPipelineTests(unittest.TestCase):
@@ -115,7 +115,8 @@ class RunPipelineTests(unittest.TestCase):
         out_dir = self.tmpdir / "artifacts" / "current"
         snapshots_dir = self.tmpdir / "artifacts" / "snapshots"
         deltas_dir = self.tmpdir / "artifacts" / "deltas"
-        plots_dir = self.tmpdir / "artifacts" / "plots"
+        snapshot_date = "2026-03-29"
+        plots_dir = snapshots_dir / snapshot_date / "plots"
         out_dir.mkdir(parents=True, exist_ok=True)
         plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,10 +148,10 @@ class RunPipelineTests(unittest.TestCase):
             run_nvd=False,
             run_epss=False,
             out_dir=out_dir,
-            plots_dir=plots_dir,
             snapshots_dir=snapshots_dir,
             deltas_dir=deltas_dir,
             generate_plots=False,
+            snapshot_date=pd.to_datetime(snapshot_date).date(),
         )
 
         with patch("kev_pipeline.pipeline.download_kev_raw_df", return_value=raw_df):
