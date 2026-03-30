@@ -20,7 +20,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-epss", action="store_true", help="Enable optional EPSS enrichment.")
     parser.add_argument("--nvd-api-key", default="", help="Optional NVD API key.")
     parser.add_argument("--out-dir", default="artifacts/current", help="Directory for canonical output files.")
-    parser.add_argument("--plots-dir", default="artifacts/plots", help="Directory for generated plots.")
     parser.add_argument("--snapshots-dir", default="artifacts/snapshots", help="Directory for dated snapshots.")
     parser.add_argument("--deltas-dir", default="artifacts/deltas", help="Directory for daily delta files.")
     parser.add_argument("--snapshot-date", type=_parse_date, help="Snapshot date in YYYY-MM-DD.")
@@ -38,7 +37,6 @@ def main() -> int:
         run_nvd=args.run_nvd,
         run_epss=args.run_epss,
         out_dir=Path(args.out_dir),
-        plots_dir=Path(args.plots_dir),
         snapshots_dir=Path(args.snapshots_dir),
         deltas_dir=Path(args.deltas_dir),
         nvd_api_key=args.nvd_api_key,

@@ -613,7 +613,7 @@ def _date_metrics(events_df: pd.DataFrame) -> Dict[str, object]:
 
 def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
     files = config.files
-    _clear_output_state(files, config.plots_dir)
+    _clear_output_state(files, config.snapshot_plots_dir)
 
     _ensure_dir(config.out_dir)
     _ensure_dir(config.snapshots_dir)
@@ -696,7 +696,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
             threats_daily_counts_df=threats_daily_counts_df,
             threats_by_vendor_df=threats_by_vendor_df,
             threats_by_product_df=threats_by_product_df,
-            plots_dir=config.plots_dir,
+            plots_dir=config.snapshot_plots_dir,
         )
 
     previous_snapshot_dir = _find_previous_snapshot(config.snapshots_dir, config.snapshot_date.isoformat())
@@ -742,7 +742,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
     snapshot_files = _copy_outputs_to_snapshot(
         files,
         config.snapshot_dir,
-        config.plots_dir,
+        config.snapshot_plots_dir,
         include_plots=config.generate_plots,
     )
     summary["snapshot_files"] = snapshot_files

@@ -16,7 +16,6 @@ class PipelineConfig:
     run_nvd: bool = False
     run_epss: bool = False
     out_dir: Path = Path("artifacts/current")
-    plots_dir: Path = Path("artifacts/plots")
     snapshots_dir: Path = Path("artifacts/snapshots")
     deltas_dir: Path = Path("artifacts/deltas")
     kev_csv_url: str = "https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
@@ -36,7 +35,6 @@ class PipelineConfig:
         if self.pipeline_mode == "kev" and self.run_nvd:
             self.run_nvd = False
         self.out_dir = Path(self.out_dir)
-        self.plots_dir = Path(self.plots_dir)
         self.snapshots_dir = Path(self.snapshots_dir)
         self.deltas_dir = Path(self.deltas_dir)
 
@@ -61,3 +59,7 @@ class PipelineConfig:
     @property
     def delta_dir(self) -> Path:
         return self.deltas_dir / self.snapshot_date.isoformat()
+
+    @property
+    def snapshot_plots_dir(self) -> Path:
+        return self.snapshot_dir / "plots"
