@@ -68,6 +68,20 @@ GITHUB_TOKEN=seu_token_github
 
 Argumentos de linha de comando continuam tendo precedência sobre o `.env`.
 
+## Higiene do notebook
+
+- `artifacts/` é local e já fica fora do Git
+- o notebook deve ser commitado sem outputs
+- o `summary.json` do pipeline usa caminhos relativos para reduzir vazamento de path local
+
+Para ativar a limpeza automática de outputs antes de cada commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+O hook chama `python3 scripts/strip_notebook_output.py` para limpar `outputs` e `execution_count` de arquivos `.ipynb` staged.
+
 ## Execução
 
 KEV-only:
