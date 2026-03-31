@@ -16,6 +16,18 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def serialize_path(path: Path, base_dir: Optional[Path] = None) -> str:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return str(candidate)
+
+    anchor = (base_dir or Path.cwd()).resolve()
+    try:
+        return str(candidate.resolve().relative_to(anchor))
+    except ValueError:
+        return str(candidate)
+
+
 def link_or_copy_file(source: Path, destination: Path, allow_hardlink: bool = True) -> None:
     if destination.exists():
         destination.unlink()

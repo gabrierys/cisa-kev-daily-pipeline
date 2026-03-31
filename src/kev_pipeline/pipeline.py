@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 
-from .common import clear_output_state, ensure_dir, link_or_copy_file, save_csv
+from .common import clear_output_state, ensure_dir, link_or_copy_file, save_csv, serialize_path
 from .config import PipelineConfig
 from .github_advisories import fetch_github_advisories_for_cves
 from .kev import build_daily_counts, build_top_tables, download_kev_raw_df, normalize_kev_events, parse_notes
@@ -53,6 +53,7 @@ def build_delta_outputs(
     current_enriched_df: pd.DataFrame,
     previous_snapshot_dir: Optional[Path],
     delta_dir: Path,
+    path_base_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
     ensure_dir(delta_dir)
 
@@ -100,7 +101,7 @@ def build_delta_outputs(
             "new_urgent_today": int(len(new_urgent_df)),
             "new_ransomware_today": int(len(new_ransomware_df)),
         },
-        "files": {name: str(path) for name, path in delta_files.items()},
+        "files": {name: serialize_path(path, path_base_dir) for name, path in delta_files.items()},
     }
 
 
@@ -109,6 +110,7 @@ def _copy_outputs_to_snapshot(
     snapshot_dir: Path,
     plots_dir: Path,
     include_plots: bool,
+    path_base_dir: Optional[Path] = None,
 ) -> Dict[str, str]:
     ensure_dir(snapshot_dir)
     copied = {}
@@ -116,7 +118,7 @@ def _copy_outputs_to_snapshot(
         if path.exists():
             destination = snapshot_dir / path.name
             link_or_copy_file(path, destination, allow_hardlink=name != "summary")
-            copied[name] = str(destination)
+            copied[name] = serialize_path(destination, path_base_dir)
 
     if include_plots and plots_dir.exists():
         snapshot_plots_dir = snapshot_dir / "plots"
@@ -124,7 +126,7 @@ def _copy_outputs_to_snapshot(
         for plot_file in plots_dir.glob("*"):
             if plot_file.is_file():
                 link_or_copy_file(plot_file, snapshot_plots_dir / plot_file.name)
-        copied["plots_dir"] = str(snapshot_plots_dir)
+        copied["plots_dir"] = serialize_path(snapshot_plots_dir, path_base_dir)
 
     return copied
 
@@ -230,6 +232,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
 
     session = requests.Session()
     session.headers.update({"User-Agent": config.user_agent})
+    path_base_dir = Path.cwd().resolve()
 
     execution_warnings: List[str] = []
     enrichment_failures: List[Dict[str, str]] = []
@@ -330,6 +333,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
         current_enriched_df=threats_daily_enriched_df,
         previous_snapshot_dir=previous_snapshot_dir,
         delta_dir=config.delta_dir,
+        path_base_dir=path_base_dir,
     )
 
     summary = {
@@ -358,18 +362,18 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
             "items": enrichment_failures,
         },
         "cache": {
-            "nvd_cache_file": str(config.nvd_cache_file) if config.nvd_cache_file.exists() else "",
-            "nvd_sync_state_file": str(config.nvd_sync_state_file) if config.nvd_sync_state_file.exists() else "",
-            "github_cache_file": str(config.github_cache_file) if config.github_cache_file.exists() else "",
-            "github_sync_state_file": str(config.github_sync_state_file) if config.github_sync_state_file.exists() else "",
+            "nvd_cache_file": serialize_path(config.nvd_cache_file, path_base_dir) if config.nvd_cache_file.exists() else "",
+            "nvd_sync_state_file": serialize_path(config.nvd_sync_state_file, path_base_dir) if config.nvd_sync_state_file.exists() else "",
+            "github_cache_file": serialize_path(config.github_cache_file, path_base_dir) if config.github_cache_file.exists() else "",
+            "github_sync_state_file": serialize_path(config.github_sync_state_file, path_base_dir) if config.github_sync_state_file.exists() else "",
         },
         "files": {},
     }
 
     files["summary"].write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    summary["files"] = {name: str(path) for name, path in files.items() if path.exists()}
-    summary["files"]["snapshot_dir"] = str(config.snapshot_dir)
-    summary["files"]["delta_dir"] = str(config.delta_dir)
+    summary["files"] = {name: serialize_path(path, path_base_dir) for name, path in files.items() if path.exists()}
+    summary["files"]["snapshot_dir"] = serialize_path(config.snapshot_dir, path_base_dir)
+    summary["files"]["delta_dir"] = serialize_path(config.delta_dir, path_base_dir)
     files["summary"].write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     snapshot_files = _copy_outputs_to_snapshot(
@@ -377,6 +381,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
         config.snapshot_dir,
         config.snapshot_plots_dir,
         include_plots=config.generate_plots,
+        path_base_dir=path_base_dir,
     )
     summary["snapshot_files"] = snapshot_files
     files["summary"].write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
