@@ -5,10 +5,10 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
@@ -66,6 +66,20 @@ CRITICAL_INFRA_PATTERNS: Tuple[str, ...] = (
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _link_or_copy_file(source: Path, destination: Path, allow_hardlink: bool = True) -> None:
+    if destination.exists():
+        destination.unlink()
+
+    if allow_hardlink:
+        try:
+            os.link(source, destination)
+            return
+        except OSError:
+            pass
+
+    shutil.copy2(source, destination)
 
 
 def _clear_output_state(files: Dict[str, Path], plots_dir: Path) -> None:
@@ -317,21 +331,194 @@ def _extract_nvd_description(cve_obj: Dict[str, object]) -> str:
     return ""
 
 
-def fetch_nvd_enrichment_for_cves(
+NVD_ENRICHMENT_COLUMNS: Tuple[str, ...] = (
+    "cve_id",
+    "nvd_published",
+    "nvd_last_modified",
+    "nvd_severity",
+    "nvd_cvss_score",
+    "nvd_description",
+)
+
+
+def _empty_nvd_enrichment_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(NVD_ENRICHMENT_COLUMNS))
+
+
+def _normalize_nvd_vulnerabilities(vulnerabilities: Sequence[object]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for vulnerability in vulnerabilities:
+        if not isinstance(vulnerability, dict):
+            continue
+        cve_obj = vulnerability.get("cve", {})
+        if not isinstance(cve_obj, dict):
+            continue
+        cve_id = str(cve_obj.get("id", "")).strip()
+        if not cve_id.startswith("CVE-"):
+            continue
+        severity, cvss_score = _extract_nvd_metrics(cve_obj)
+        rows.append(
+            {
+                "cve_id": cve_id,
+                "nvd_published": cve_obj.get("published", ""),
+                "nvd_last_modified": cve_obj.get("lastModified", ""),
+                "nvd_severity": severity,
+                "nvd_cvss_score": cvss_score,
+                "nvd_description": _extract_nvd_description(cve_obj),
+            }
+        )
+    if not rows:
+        return _empty_nvd_enrichment_df()
+    return pd.DataFrame(rows, columns=list(NVD_ENRICHMENT_COLUMNS))
+
+
+def _load_nvd_cache(cache_file: Path) -> pd.DataFrame:
+    if not cache_file.exists():
+        return _empty_nvd_enrichment_df()
+
+    try:
+        cache_df = pd.read_csv(cache_file)
+    except (pd.errors.EmptyDataError, OSError):
+        return _empty_nvd_enrichment_df()
+    for column in NVD_ENRICHMENT_COLUMNS:
+        if column not in cache_df.columns:
+            cache_df[column] = ""
+    return cache_df[list(NVD_ENRICHMENT_COLUMNS)].copy()
+
+
+def _merge_nvd_cache_frames(existing_df: pd.DataFrame, updates_df: pd.DataFrame) -> pd.DataFrame:
+    if existing_df.empty:
+        merged = updates_df.copy()
+    elif updates_df.empty:
+        merged = existing_df.copy()
+    else:
+        merged = pd.concat([existing_df, updates_df], ignore_index=True)
+
+    if merged.empty:
+        return _empty_nvd_enrichment_df()
+
+    merged["_nvd_last_modified_sort"] = pd.to_datetime(merged["nvd_last_modified"], utc=True, errors="coerce")
+    merged = merged.sort_values(["cve_id", "_nvd_last_modified_sort"], ascending=[True, True])
+    merged = merged.drop_duplicates(subset=["cve_id"], keep="last")
+    merged = merged.drop(columns=["_nvd_last_modified_sort"])
+    return merged[list(NVD_ENRICHMENT_COLUMNS)].sort_values("cve_id").reset_index(drop=True)
+
+
+def _load_nvd_sync_state(state_file: Path) -> Dict[str, str]:
+    if not state_file.exists():
+        return {}
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_nvd_sync_state(state_file: Path, last_sync_utc: datetime) -> None:
+    state_file.write_text(
+        json.dumps({"last_sync_utc": last_sync_utc.astimezone(timezone.utc).isoformat()}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _parse_sync_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_nvd_api_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _iter_nvd_date_windows(start_dt: datetime, end_dt: datetime, max_days: int) -> Iterable[Tuple[datetime, datetime]]:
+    if start_dt >= end_dt:
+        return []
+
+    windows: List[Tuple[datetime, datetime]] = []
+    cursor = start_dt
+    step = timedelta(days=max_days) - timedelta(seconds=1)
+    while cursor < end_dt:
+        window_end = min(cursor + step, end_dt)
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(seconds=1)
+    return windows
+
+
+def _request_nvd_collection(
+    session: requests.Session,
+    config: PipelineConfig,
+    base_url: str,
+    params: Dict[str, str],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    failures: List[Dict[str, str]] = []
+    frames: List[pd.DataFrame] = []
+    start_index = 0
+
+    while True:
+        page_params = dict(params)
+        page_params.update(
+            {
+                "resultsPerPage": str(config.nvd_results_per_page),
+                "startIndex": str(start_index),
+            }
+        )
+        try:
+            response = _request_with_retry(
+                session=session,
+                url=base_url,
+                params=page_params,
+                timeout=45,
+                max_retries=3,
+            )
+            data = response.json()
+            vulnerabilities = data.get("vulnerabilities", [])
+            if not isinstance(vulnerabilities, list):
+                failures.append(
+                    {
+                        "source": "nvd",
+                        "item": json.dumps(page_params, ensure_ascii=False),
+                        "error": "Unexpected response shape from NVD CVE API",
+                    }
+                )
+                break
+
+            page_df = _normalize_nvd_vulnerabilities(vulnerabilities)
+            if not page_df.empty:
+                frames.append(page_df)
+
+            total_results = int(data.get("totalResults", 0) or 0)
+            returned = int(data.get("resultsPerPage", len(vulnerabilities)) or len(vulnerabilities))
+            page_start = int(data.get("startIndex", start_index) or start_index)
+            if not vulnerabilities or page_start + returned >= total_results:
+                break
+
+            start_index = page_start + returned
+            time.sleep(config.nvd_delay_seconds)
+        except Exception as exc:
+            failures.append({"source": "nvd", "item": json.dumps(page_params, ensure_ascii=False), "error": str(exc)})
+            break
+
+    if not frames:
+        return _empty_nvd_enrichment_df(), failures
+    return _merge_nvd_cache_frames(_empty_nvd_enrichment_df(), pd.concat(frames, ignore_index=True)), failures
+
+
+def _fetch_nvd_by_cve_ids(
     session: requests.Session,
     config: PipelineConfig,
     cve_ids: Sequence[str],
 ) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
-    rows: List[Dict[str, object]] = []
+    frames: List[pd.DataFrame] = []
     failures: List[Dict[str, str]] = []
-    seen_cves = sorted(set(cve_ids))
-    if config.nvd_max_items is not None:
-        seen_cves = seen_cves[: config.nvd_max_items]
-
-    if config.nvd_api_key:
-        session.headers.update({"apiKey": config.nvd_api_key})
-
-    for cve_id in seen_cves:
+    for cve_id in sorted(set(cve_ids)):
         try:
             response = _request_with_retry(
                 session=session,
@@ -341,28 +528,83 @@ def fetch_nvd_enrichment_for_cves(
                 max_retries=3,
             )
             data = response.json()
-            vulns = data.get("vulnerabilities", [])
-            if not vulns:
+            page_df = _normalize_nvd_vulnerabilities(data.get("vulnerabilities", []))
+            if page_df.empty:
                 failures.append({"source": "nvd", "item": cve_id, "error": "CVE not found in NVD"})
                 continue
-
-            cve_obj = vulns[0].get("cve", {})
-            severity, cvss_score = _extract_nvd_metrics(cve_obj)
-            rows.append(
-                {
-                    "cve_id": cve_id,
-                    "nvd_published": cve_obj.get("published", ""),
-                    "nvd_last_modified": cve_obj.get("lastModified", ""),
-                    "nvd_severity": severity,
-                    "nvd_cvss_score": cvss_score,
-                    "nvd_description": _extract_nvd_description(cve_obj),
-                }
-            )
+            frames.append(page_df)
         except Exception as exc:
             failures.append({"source": "nvd", "item": cve_id, "error": str(exc)})
         time.sleep(config.nvd_delay_seconds)
 
-    return pd.DataFrame(rows), failures
+    if not frames:
+        return _empty_nvd_enrichment_df(), failures
+    return _merge_nvd_cache_frames(_empty_nvd_enrichment_df(), pd.concat(frames, ignore_index=True)), failures
+
+
+def fetch_nvd_enrichment_for_cves(
+    session: requests.Session,
+    config: PipelineConfig,
+    cve_ids: Sequence[str],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    failures: List[Dict[str, str]] = []
+    seen_cves = sorted(set(cve_ids))
+    if config.nvd_max_items is not None:
+        seen_cves = seen_cves[: config.nvd_max_items]
+    if not seen_cves:
+        return _empty_nvd_enrichment_df(), failures
+
+    if config.nvd_api_key:
+        session.headers.update({"apiKey": config.nvd_api_key})
+
+    # Preserve the old single-CVE behavior only when a temporary cap is set for debugging.
+    if config.nvd_max_items is not None:
+        return _fetch_nvd_by_cve_ids(session, config, seen_cves)
+
+    _ensure_dir(config.nvd_cache_dir)
+    cache_df = _load_nvd_cache(config.nvd_cache_file)
+    sync_state = _load_nvd_sync_state(config.nvd_sync_state_file)
+    now_utc = datetime.now(timezone.utc)
+
+    last_sync_utc = _parse_sync_datetime(str(sync_state.get("last_sync_utc", "")))
+    if last_sync_utc is not None:
+        windows = _iter_nvd_date_windows(last_sync_utc, now_utc, config.nvd_max_date_range_days)
+        for window_start, window_end in windows:
+            updated_df, update_failures = _request_nvd_collection(
+                session=session,
+                config=config,
+                base_url=config.nvd_api_url,
+                params={
+                    "lastModStartDate": _format_nvd_api_datetime(window_start),
+                    "lastModEndDate": _format_nvd_api_datetime(window_end),
+                },
+            )
+            failures.extend(update_failures)
+            cache_df = _merge_nvd_cache_frames(cache_df, updated_df)
+
+    kev_sync_df, kev_sync_failures = _request_nvd_collection(
+        session=session,
+        config=config,
+        base_url=f"{config.nvd_api_url}?hasKev",
+        params={},
+    )
+    failures.extend(kev_sync_failures)
+    cache_df = _merge_nvd_cache_frames(cache_df, kev_sync_df)
+
+    save_csv(cache_df, config.nvd_cache_file)
+    _save_nvd_sync_state(config.nvd_sync_state_file, now_utc)
+
+    subset_df = cache_df[cache_df["cve_id"].astype(str).isin(seen_cves)].copy()
+    missing_cves = sorted(set(seen_cves) - set(subset_df["cve_id"].astype(str)))
+    if missing_cves:
+        fallback_df, fallback_failures = _fetch_nvd_by_cve_ids(session, config, missing_cves)
+        failures.extend(fallback_failures)
+        cache_df = _merge_nvd_cache_frames(cache_df, fallback_df)
+        subset_df = cache_df[cache_df["cve_id"].astype(str).isin(seen_cves)].copy()
+        save_csv(cache_df, config.nvd_cache_file)
+        _save_nvd_sync_state(config.nvd_sync_state_file, now_utc)
+
+    return subset_df[list(NVD_ENRICHMENT_COLUMNS)].sort_values("cve_id").reset_index(drop=True), failures
 
 
 def fetch_epss_for_cves(
@@ -437,14 +679,227 @@ def _extract_github_cvss_score(advisory: Dict[str, object]) -> Optional[float]:
     return None
 
 
-def fetch_github_advisories_for_cves(
+GITHUB_ADVISORY_CACHE_COLUMNS: Tuple[str, ...] = (
+    "ghsa_id",
+    "cve_id",
+    "ghsa_modified_at",
+    "ghsa_severity",
+    "ghsa_summary",
+    "ghsa_published_at",
+    "ghsa_updated_at",
+    "ghsa_reviewed_at",
+    "ghsa_withdrawn_at",
+    "ghsa_cvss_score",
+    "ghsa_cwes",
+    "ghsa_ecosystems",
+    "ghsa_packages",
+    "ghsa_reference_urls",
+    "ghsa_epss_percentages",
+    "ghsa_epss_percentiles",
+)
+
+
+def _empty_github_advisories_cache_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(GITHUB_ADVISORY_CACHE_COLUMNS))
+
+
+def _extract_advisory_cve_id(advisory: Dict[str, object]) -> str:
+    cve_id = str(advisory.get("cve_id", "")).strip()
+    if cve_id.startswith("CVE-"):
+        return cve_id
+
+    identifiers = advisory.get("identifiers", [])
+    if not isinstance(identifiers, list):
+        return ""
+    for identifier in identifiers:
+        if not isinstance(identifier, dict):
+            continue
+        if str(identifier.get("type", "")).strip().upper() != "CVE":
+            continue
+        value = str(identifier.get("value", "")).strip()
+        if value.startswith("CVE-"):
+            return value
+    return ""
+
+
+def _normalize_github_advisories(advisories: Sequence[object]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for advisory in advisories:
+        if not isinstance(advisory, dict):
+            continue
+
+        ghsa_id = str(advisory.get("ghsa_id", "")).strip()
+        cve_id = _extract_advisory_cve_id(advisory)
+        if not ghsa_id or not cve_id:
+            continue
+
+        references = [
+            reference
+            for reference in advisory.get("references", [])
+            if isinstance(reference, str) and reference.strip()
+        ]
+        cwes = [
+            str(cwe.get("cwe_id", "")).strip()
+            for cwe in advisory.get("cwes", [])
+            if isinstance(cwe, dict) and str(cwe.get("cwe_id", "")).strip()
+        ]
+
+        ecosystems: List[str] = []
+        packages: List[str] = []
+        for item in advisory.get("vulnerabilities", []):
+            if not isinstance(item, dict):
+                continue
+            package = item.get("package", {})
+            if not isinstance(package, dict):
+                continue
+            ecosystem = str(package.get("ecosystem", "")).strip()
+            package_name = str(package.get("name", "")).strip()
+            if ecosystem:
+                ecosystems.append(ecosystem)
+            if package_name:
+                packages.append(package_name)
+
+        epss_percentages: List[str] = []
+        epss_percentiles: List[str] = []
+        for epss_item in advisory.get("epss", []):
+            if not isinstance(epss_item, dict):
+                continue
+            percentage = epss_item.get("percentage")
+            percentile = epss_item.get("percentile")
+            if percentage not in [None, ""]:
+                epss_percentages.append(str(percentage))
+            if percentile not in [None, ""]:
+                epss_percentiles.append(str(percentile))
+
+        ghsa_updated_at = str(advisory.get("updated_at", "")).strip()
+        ghsa_published_at = str(advisory.get("published_at", "")).strip()
+        rows.append(
+            {
+                "ghsa_id": ghsa_id,
+                "cve_id": cve_id,
+                "ghsa_modified_at": ghsa_updated_at or ghsa_published_at,
+                "ghsa_severity": str(advisory.get("severity", "")).strip(),
+                "ghsa_summary": str(advisory.get("summary", "")).strip(),
+                "ghsa_published_at": ghsa_published_at,
+                "ghsa_updated_at": ghsa_updated_at,
+                "ghsa_reviewed_at": str(advisory.get("github_reviewed_at", "")).strip(),
+                "ghsa_withdrawn_at": str(advisory.get("withdrawn_at", "")).strip(),
+                "ghsa_cvss_score": _extract_github_cvss_score(advisory),
+                "ghsa_cwes": _join_unique_text(cwes),
+                "ghsa_ecosystems": _join_unique_text(ecosystems),
+                "ghsa_packages": _join_unique_text(packages),
+                "ghsa_reference_urls": _join_unique_text(references),
+                "ghsa_epss_percentages": _join_unique_text(epss_percentages),
+                "ghsa_epss_percentiles": _join_unique_text(epss_percentiles),
+            }
+        )
+
+    if not rows:
+        return _empty_github_advisories_cache_df()
+    return pd.DataFrame(rows, columns=list(GITHUB_ADVISORY_CACHE_COLUMNS))
+
+
+def _load_github_advisories_cache(cache_file: Path) -> pd.DataFrame:
+    if not cache_file.exists():
+        return _empty_github_advisories_cache_df()
+    try:
+        cache_df = pd.read_csv(cache_file)
+    except (pd.errors.EmptyDataError, OSError):
+        return _empty_github_advisories_cache_df()
+    for column in GITHUB_ADVISORY_CACHE_COLUMNS:
+        if column not in cache_df.columns:
+            cache_df[column] = ""
+    return cache_df[list(GITHUB_ADVISORY_CACHE_COLUMNS)].copy()
+
+
+def _merge_github_advisories_cache(existing_df: pd.DataFrame, updates_df: pd.DataFrame) -> pd.DataFrame:
+    if existing_df.empty:
+        merged = updates_df.copy()
+    elif updates_df.empty:
+        merged = existing_df.copy()
+    else:
+        merged = pd.concat([existing_df, updates_df], ignore_index=True)
+
+    if merged.empty:
+        return _empty_github_advisories_cache_df()
+
+    merged["_ghsa_modified_sort"] = pd.to_datetime(merged["ghsa_modified_at"], utc=True, errors="coerce")
+    merged = merged.sort_values(["ghsa_id", "_ghsa_modified_sort"], ascending=[True, True])
+    merged = merged.drop_duplicates(subset=["ghsa_id"], keep="last")
+    merged = merged.drop(columns=["_ghsa_modified_sort"])
+    return merged[list(GITHUB_ADVISORY_CACHE_COLUMNS)].sort_values(["cve_id", "ghsa_id"]).reset_index(drop=True)
+
+
+def _aggregate_github_advisories_by_cve(cache_df: pd.DataFrame, cve_ids: Sequence[str]) -> pd.DataFrame:
+    if cache_df.empty:
+        return pd.DataFrame()
+
+    filtered_df = cache_df[cache_df["cve_id"].astype(str).isin(sorted(set(cve_ids)))].copy()
+    if filtered_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, object]] = []
+    for cve_id, group in filtered_df.groupby("cve_id", dropna=True):
+        cvss_scores = pd.to_numeric(group["ghsa_cvss_score"], errors="coerce").dropna()
+        rows.append(
+            {
+                "cve_id": cve_id,
+                "ghsa_advisory_count": int(group["ghsa_id"].nunique()),
+                "ghsa_ids": _join_unique_text(group["ghsa_id"].tolist()),
+                "ghsa_severities": _join_unique_text(group["ghsa_severity"].tolist()),
+                "ghsa_summaries": _join_unique_text(group["ghsa_summary"].tolist()),
+                "ghsa_published_at": _join_unique_text(group["ghsa_published_at"].tolist()),
+                "ghsa_updated_at": _join_unique_text(group["ghsa_updated_at"].tolist()),
+                "ghsa_reviewed_at": _join_unique_text(group["ghsa_reviewed_at"].tolist()),
+                "ghsa_has_withdrawn": bool(group["ghsa_withdrawn_at"].fillna("").astype(str).str.strip().ne("").any()),
+                "ghsa_cvss_score_max": None if cvss_scores.empty else float(cvss_scores.max()),
+                "ghsa_cwes": _join_unique_text(group["ghsa_cwes"].tolist()),
+                "ghsa_ecosystems": _join_unique_text(group["ghsa_ecosystems"].tolist()),
+                "ghsa_packages": _join_unique_text(group["ghsa_packages"].tolist()),
+                "ghsa_reference_urls": _join_unique_text(group["ghsa_reference_urls"].tolist()),
+                "ghsa_epss_percentages": _join_unique_text(group["ghsa_epss_percentages"].tolist()),
+                "ghsa_epss_percentiles": _join_unique_text(group["ghsa_epss_percentiles"].tolist()),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("cve_id").reset_index(drop=True)
+
+
+def _extract_next_cursor_from_link_header(link_header: str) -> str:
+    if not link_header:
+        return ""
+    for part in link_header.split(","):
+        section = part.strip()
+        if 'rel="next"' not in section:
+            continue
+        match = re.search(r"<([^>]+)>", section)
+        if not match:
+            continue
+        query = urlparse(match.group(1)).query
+        after_vals = parse_qs(query).get("after", [])
+        if after_vals:
+            return after_vals[0]
+    return ""
+
+
+def _advisory_sort_datetime(advisory: Dict[str, object]) -> Optional[datetime]:
+    if not isinstance(advisory, dict):
+        return None
+    for key in ["updated_at", "published_at"]:
+        parsed = _parse_sync_datetime(str(advisory.get(key, "")).strip())
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _request_github_advisories_collection(
     session: requests.Session,
     config: PipelineConfig,
-    cve_ids: Sequence[str],
+    stop_at: Optional[datetime] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
-    rows: List[Dict[str, object]] = []
     failures: List[Dict[str, str]] = []
-    seen_cves = sorted(set(cve_ids))
+    frames: List[pd.DataFrame] = []
+    after_cursor = ""
 
     session.headers.update(
         {
@@ -452,8 +907,83 @@ def fetch_github_advisories_for_cves(
             "X-GitHub-Api-Version": config.github_api_version,
         }
     )
+    if config.github_token:
+        session.headers.update({"Authorization": f"Bearer {config.github_token}"})
 
-    for cve_id in seen_cves:
+    while True:
+        params = {
+            "type": "reviewed",
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": str(config.github_results_per_page),
+        }
+        if after_cursor:
+            params["after"] = after_cursor
+        try:
+            response = _request_with_retry(
+                session=session,
+                url=config.github_advisories_api_url,
+                params=params,
+                timeout=45,
+                max_retries=3,
+            )
+            advisories = response.json()
+            if not isinstance(advisories, list):
+                failures.append(
+                    {
+                        "source": "github_advisories",
+                        "item": json.dumps(params, ensure_ascii=False),
+                        "error": "Unexpected response shape from GitHub advisories API",
+                    }
+                )
+                break
+
+            page_df = _normalize_github_advisories(advisories)
+            if not page_df.empty:
+                frames.append(page_df)
+
+            oldest_seen = None
+            for advisory in advisories:
+                advisory_dt = _advisory_sort_datetime(advisory)
+                if advisory_dt is None:
+                    continue
+                if oldest_seen is None or advisory_dt < oldest_seen:
+                    oldest_seen = advisory_dt
+
+            if stop_at is not None and oldest_seen is not None and oldest_seen <= stop_at:
+                break
+
+            after_cursor = _extract_next_cursor_from_link_header(response.headers.get("Link", ""))
+            if not after_cursor:
+                break
+        except Exception as exc:
+            failures.append({"source": "github_advisories", "item": json.dumps(params, ensure_ascii=False), "error": str(exc)})
+            break
+        time.sleep(config.github_delay_seconds)
+
+    if not frames:
+        return _empty_github_advisories_cache_df(), failures
+    return _merge_github_advisories_cache(_empty_github_advisories_cache_df(), pd.concat(frames, ignore_index=True)), failures
+
+
+def _fetch_github_advisories_by_cve_ids(
+    session: requests.Session,
+    config: PipelineConfig,
+    cve_ids: Sequence[str],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    frames: List[pd.DataFrame] = []
+    failures: List[Dict[str, str]] = []
+
+    session.headers.update(
+        {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": config.github_api_version,
+        }
+    )
+    if config.github_token:
+        session.headers.update({"Authorization": f"Bearer {config.github_token}"})
+
+    for cve_id in sorted(set(cve_ids)):
         try:
             response = _request_with_retry(
                 session=session,
@@ -472,88 +1002,67 @@ def fetch_github_advisories_for_cves(
                     }
                 )
                 continue
-            advisories = [advisory for advisory in advisories if isinstance(advisory, dict)]
-            if not advisories:
+            page_df = _normalize_github_advisories(advisories)
+            if page_df.empty:
                 continue
-
-            references: List[str] = []
-            cwes: List[str] = []
-            ecosystems: List[str] = []
-            packages: List[str] = []
-            epss_percentages: List[str] = []
-            epss_percentiles: List[str] = []
-            cvss_scores: List[float] = []
-
-            for advisory in advisories:
-                references.extend(
-                    reference
-                    for reference in advisory.get("references", [])
-                    if isinstance(reference, str) and reference.strip()
-                )
-                for cwe in advisory.get("cwes", []):
-                    if isinstance(cwe, dict):
-                        cwes.append(cwe.get("cwe_id", ""))
-
-                for epss_item in advisory.get("epss", []):
-                    if isinstance(epss_item, dict):
-                        percentage = epss_item.get("percentage")
-                        percentile = epss_item.get("percentile")
-                        if percentage not in [None, ""]:
-                            epss_percentages.append(str(percentage))
-                        if percentile not in [None, ""]:
-                            epss_percentiles.append(str(percentile))
-
-                vulnerabilities = advisory.get("vulnerabilities", [])
-                if not isinstance(vulnerabilities, list):
-                    continue
-                for item in vulnerabilities:
-                    if not isinstance(item, dict):
-                        continue
-                    package = item.get("package", {})
-                    if not isinstance(package, dict):
-                        continue
-                    ecosystem = str(package.get("ecosystem", "")).strip()
-                    package_name = str(package.get("name", "")).strip()
-                    if ecosystem:
-                        ecosystems.append(ecosystem)
-                    if package_name:
-                        packages.append(package_name)
-
-                cvss_score = _extract_github_cvss_score(advisory)
-                if cvss_score is not None:
-                    cvss_scores.append(cvss_score)
-
-            rows.append(
-                {
-                    "cve_id": cve_id,
-                    "ghsa_advisory_count": len(advisories),
-                    "ghsa_ids": _join_unique_text(advisory.get("ghsa_id", "") for advisory in advisories),
-                    "ghsa_severities": _join_unique_text(advisory.get("severity", "") for advisory in advisories),
-                    "ghsa_summaries": _join_unique_text(advisory.get("summary", "") for advisory in advisories),
-                    "ghsa_published_at": _join_unique_text(
-                        sorted(advisory.get("published_at", "") for advisory in advisories)
-                    ),
-                    "ghsa_updated_at": _join_unique_text(
-                        sorted(advisory.get("updated_at", "") for advisory in advisories)
-                    ),
-                    "ghsa_reviewed_at": _join_unique_text(
-                        sorted(advisory.get("github_reviewed_at", "") for advisory in advisories)
-                    ),
-                    "ghsa_has_withdrawn": any(bool(advisory.get("withdrawn_at")) for advisory in advisories),
-                    "ghsa_cvss_score_max": max(cvss_scores) if cvss_scores else None,
-                    "ghsa_cwes": _join_unique_text(cwes),
-                    "ghsa_ecosystems": _join_unique_text(ecosystems),
-                    "ghsa_packages": _join_unique_text(packages),
-                    "ghsa_reference_urls": _join_unique_text(references),
-                    "ghsa_epss_percentages": _join_unique_text(epss_percentages),
-                    "ghsa_epss_percentiles": _join_unique_text(epss_percentiles),
-                }
-            )
+            frames.append(page_df)
         except Exception as exc:
             failures.append({"source": "github_advisories", "item": cve_id, "error": str(exc)})
         time.sleep(config.github_delay_seconds)
 
-    return pd.DataFrame(rows), failures
+    if not frames:
+        return _empty_github_advisories_cache_df(), failures
+    return _merge_github_advisories_cache(_empty_github_advisories_cache_df(), pd.concat(frames, ignore_index=True)), failures
+
+
+def fetch_github_advisories_for_cves(
+    session: requests.Session,
+    config: PipelineConfig,
+    cve_ids: Sequence[str],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    failures: List[Dict[str, str]] = []
+    seen_cves = sorted(set(cve_ids))
+    if not seen_cves:
+        return pd.DataFrame(), failures
+
+    _ensure_dir(config.github_cache_dir)
+    cache_df = _load_github_advisories_cache(config.github_cache_file)
+    sync_state = _load_nvd_sync_state(config.github_sync_state_file)
+    now_utc = datetime.now(timezone.utc)
+    last_sync_utc = _parse_sync_datetime(str(sync_state.get("last_sync_utc", "")))
+
+    synced_df, sync_failures = _request_github_advisories_collection(
+        session=session,
+        config=config,
+        stop_at=last_sync_utc,
+    )
+    failures.extend(sync_failures)
+    cache_df = _merge_github_advisories_cache(cache_df, synced_df)
+    save_csv(cache_df, config.github_cache_file)
+    _save_nvd_sync_state(config.github_sync_state_file, now_utc)
+
+    aggregated_df = _aggregate_github_advisories_by_cve(cache_df, seen_cves)
+    missing_cves = sorted(set(seen_cves) - set(aggregated_df.get("cve_id", pd.Series(dtype=str)).astype(str)))
+    if missing_cves and len(missing_cves) <= config.github_fallback_max_cves:
+        fallback_df, fallback_failures = _fetch_github_advisories_by_cve_ids(session, config, missing_cves)
+        failures.extend(fallback_failures)
+        cache_df = _merge_github_advisories_cache(cache_df, fallback_df)
+        save_csv(cache_df, config.github_cache_file)
+        _save_nvd_sync_state(config.github_sync_state_file, now_utc)
+        aggregated_df = _aggregate_github_advisories_by_cve(cache_df, seen_cves)
+    elif missing_cves:
+        failures.append(
+            {
+                "source": "github_advisories",
+                "item": f"{len(missing_cves)} missing CVEs",
+                "error": (
+                    "Skipped direct GitHub advisory fallback because the missing CVE set exceeded "
+                    f"github_fallback_max_cves={config.github_fallback_max_cves}."
+                ),
+            }
+        )
+
+    return aggregated_df, failures
 
 
 def build_enriched_events(
@@ -657,7 +1166,8 @@ def _copy_outputs_to_snapshot(
     for name, path in files.items():
         if path.exists():
             destination = snapshot_dir / path.name
-            shutil.copy2(path, destination)
+            # Hard links keep snapshot history without duplicating large CSV blobs.
+            _link_or_copy_file(path, destination, allow_hardlink=name != "summary")
             copied[name] = str(destination)
 
     if include_plots and plots_dir.exists():
@@ -665,7 +1175,7 @@ def _copy_outputs_to_snapshot(
         _ensure_dir(snapshot_plots_dir)
         for plot_file in plots_dir.glob("*"):
             if plot_file.is_file():
-                shutil.copy2(plot_file, snapshot_plots_dir / plot_file.name)
+                _link_or_copy_file(plot_file, snapshot_plots_dir / plot_file.name)
         copied["plots_dir"] = str(snapshot_plots_dir)
 
     return copied
@@ -767,6 +1277,8 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
     _ensure_dir(config.out_dir)
     _ensure_dir(config.snapshots_dir)
     _ensure_dir(config.deltas_dir)
+    _ensure_dir(config.nvd_cache_dir)
+    _ensure_dir(config.github_cache_dir)
 
     session = requests.Session()
     session.headers.update({"User-Agent": config.user_agent})
@@ -897,6 +1409,12 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
         "enrichment_failures": {
             "count": len(enrichment_failures),
             "items": enrichment_failures,
+        },
+        "cache": {
+            "nvd_cache_file": str(config.nvd_cache_file) if config.nvd_cache_file.exists() else "",
+            "nvd_sync_state_file": str(config.nvd_sync_state_file) if config.nvd_sync_state_file.exists() else "",
+            "github_cache_file": str(config.github_cache_file) if config.github_cache_file.exists() else "",
+            "github_sync_state_file": str(config.github_sync_state_file) if config.github_sync_state_file.exists() else "",
         },
         "files": {},
     }
