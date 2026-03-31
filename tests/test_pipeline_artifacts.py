@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from kev_pipeline.common import serialize_path
+from kev_pipeline.common import link_or_copy_file, serialize_path
 from kev_pipeline.pipeline import _copy_outputs_to_snapshot, build_delta_outputs
 
 
@@ -78,6 +78,16 @@ class DeltaTests(unittest.TestCase):
         self.assertNotEqual(summary_file.stat().st_ino, snapshot_summary_file.stat().st_ino)
         self.assertEqual(plot_file.stat().st_ino, snapshot_plot_file.stat().st_ino)
         self.assertIn("plots_dir", copied)
+
+    def test_link_or_copy_file_is_noop_when_source_and_destination_match(self) -> None:
+        file_path = self.tmpdir / "summary.json"
+        file_path.write_text('{"ok": true}', encoding="utf-8")
+
+        before_inode = file_path.stat().st_ino
+        link_or_copy_file(file_path, file_path)
+
+        self.assertTrue(file_path.exists())
+        self.assertEqual(file_path.stat().st_ino, before_inode)
 
     def test_serialize_path_relativizes_paths_inside_working_directory(self) -> None:
         previous_cwd = Path.cwd()

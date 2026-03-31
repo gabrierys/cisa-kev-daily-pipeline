@@ -188,6 +188,54 @@ class RunPipelineTests(unittest.TestCase):
         self.assertEqual(summary["files"]["delta_dir"], "artifacts/deltas/2026-03-30")
         self.assertEqual(summary["delta"]["files"]["new_cves_today"], "artifacts/deltas/2026-03-30/new_cves_today.csv")
 
+    def test_run_with_plots_enabled_handles_snapshot_plot_dir(self) -> None:
+        out_dir = self.tmpdir / "artifacts" / "current"
+        snapshots_dir = self.tmpdir / "artifacts" / "snapshots"
+        deltas_dir = self.tmpdir / "artifacts" / "deltas"
+        snapshot_date = "2026-03-31"
+
+        raw_df = pd.DataFrame(
+            [
+                {
+                    "dateAdded": "2026-03-27",
+                    "cveID": "CVE-2026-0001",
+                    "vendorProject": "Example",
+                    "product": "Widget",
+                    "dueDate": "2026-04-10",
+                    "knownRansomwareCampaignUse": "Known",
+                    "notes": "Patch available",
+                }
+            ]
+        )
+
+        config = PipelineConfig(
+            pipeline_mode="kev",
+            run_nvd=False,
+            run_epss=False,
+            out_dir=out_dir,
+            snapshots_dir=snapshots_dir,
+            deltas_dir=deltas_dir,
+            generate_plots=True,
+            snapshot_date=pd.to_datetime(snapshot_date).date(),
+        )
+
+        def fake_generate_plots(*, plots_dir: Path, **_: object) -> None:
+            plots_dir.mkdir(parents=True, exist_ok=True)
+            (plots_dir / "02_threats_top_vendors.html").write_text("<html></html>", encoding="utf-8")
+
+        with patch("kev_pipeline.pipeline.download_kev_raw_df", return_value=raw_df), patch(
+            "kev_pipeline.pipeline.generate_plots",
+            side_effect=fake_generate_plots,
+        ):
+            summary = run_pipeline(config)
+
+        plot_path = snapshots_dir / snapshot_date / "plots" / "02_threats_top_vendors.html"
+        self.assertTrue(plot_path.exists())
+        self.assertEqual(
+            summary["snapshot_files"]["plots_dir"],
+            str(snapshots_dir / snapshot_date / "plots"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
