@@ -12,7 +12,7 @@ O pipeline:
 - normaliza uma base canônica por CVE
 - gera agregações diárias, por vendor e por product
 - mantém snapshots e deltas locais por data
-- adiciona NVD e EPSS apenas como enriquecimentos opcionais
+- adiciona NVD, EPSS e GitHub Security Advisories como enriquecimentos opcionais
 
 Entregáveis canônicos:
 
@@ -26,6 +26,7 @@ Enriquecimentos opcionais:
 
 - `artifacts/current/enrich_nvd.csv`
 - `artifacts/current/enrich_epss.csv`
+- `artifacts/current/enrich_github_advisories.csv`
 - `artifacts/current/threats_daily_enriched.csv`
 
 Histórico local:
@@ -44,7 +45,7 @@ O campo `dateAdded` é adotado como referência temporal por representar o ingre
 
 O caminho crítico do pipeline não depende de serviços externos além da fonte principal KEV. Isso reduz risco operacional em cenários de indisponibilidade, latência ou limitação de taxa de APIs adicionais.
 
-NVD e EPSS são tratados como camadas opcionais. Falhas nesses enriquecimentos não interrompem a geração dos arquivos principais, mas passam a ser registradas explicitamente no `summary.json`.
+NVD, EPSS e GitHub Security Advisories são tratados como camadas opcionais. Falhas nesses enriquecimentos não interrompem a geração dos arquivos principais, mas passam a ser registradas explicitamente no `summary.json`.
 
 Os artefatos de execução ficam isolados em `artifacts/` por padrão. Isso reduz poluição na raiz do repositório, evita confusão entre código e saídas geradas e melhora a segurança operacional do projeto.
 
@@ -80,14 +81,14 @@ python3 scripts/run_kev_pipeline.py --mode kev
 ### Full (com enriquecimentos opcionais)
 
 ```bash
-python3 scripts/run_kev_pipeline.py --mode full --run-nvd --run-epss
+python3 scripts/run_kev_pipeline.py --mode full --run-nvd --run-epss --run-github-advisories
 ```
 
 Após `pip install -e .`:
 
 ```bash
 kev-pipeline --mode kev
-kev-pipeline --mode full --run-nvd --run-epss
+kev-pipeline --mode full --run-nvd --run-epss --run-github-advisories
 ```
 
 ## Esquema da base canônica
@@ -125,6 +126,7 @@ Campos derivados de `notes`:
 - `--snapshots-dir PATH`: muda a pasta do histórico local
 - `--deltas-dir PATH`: muda a pasta de deltas
 - `--nvd-api-key TOKEN`: informa chave opcional do NVD
+- `--run-github-advisories`: habilita enriquecimento adicional com GitHub Security Advisories
 
 ## Estrutura do notebook
 
