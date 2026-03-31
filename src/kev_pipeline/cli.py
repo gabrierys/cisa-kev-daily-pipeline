@@ -24,11 +24,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable optional GitHub Security Advisories enrichment.",
     )
     parser.add_argument("--nvd-api-key", default="", help="Optional NVD API key.")
+    parser.add_argument("--github-token", default="", help="Optional GitHub token for the advisories API.")
     parser.add_argument("--out-dir", default="artifacts/current", help="Directory for canonical output files.")
     parser.add_argument("--snapshots-dir", default="artifacts/snapshots", help="Directory for dated snapshots.")
     parser.add_argument("--deltas-dir", default="artifacts/deltas", help="Directory for daily delta files.")
     parser.add_argument("--snapshot-date", type=_parse_date, help="Snapshot date in YYYY-MM-DD.")
     parser.add_argument("--nvd-max-items", type=int, default=None, help="Optional temporary cap for NVD CVEs.")
+    parser.add_argument(
+        "--github-fallback-max-cves",
+        type=int,
+        default=25,
+        help="Max number of CVEs allowed for direct GitHub advisory fallback queries.",
+    )
     parser.add_argument("--skip-plots", action="store_true", help="Skip HTML/PNG plot generation.")
     return parser
 
@@ -46,7 +53,9 @@ def main() -> int:
         snapshots_dir=Path(args.snapshots_dir),
         deltas_dir=Path(args.deltas_dir),
         nvd_api_key=args.nvd_api_key,
+        github_token=args.github_token,
         nvd_max_items=args.nvd_max_items,
+        github_fallback_max_cves=args.github_fallback_max_cves,
         generate_plots=not args.skip_plots,
         snapshot_date=args.snapshot_date or PipelineConfig().snapshot_date,
     )
