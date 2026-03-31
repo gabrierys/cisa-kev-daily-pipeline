@@ -10,7 +10,9 @@ import pandas as pd
 
 from kev_pipeline.config import PipelineConfig
 from kev_pipeline.pipeline import (
+    _copy_outputs_to_snapshot,
     build_delta_outputs,
+    fetch_nvd_enrichment_for_cves,
     fetch_github_advisories_for_cves,
     normalize_kev_events,
     parse_notes,
@@ -19,10 +21,10 @@ from kev_pipeline.pipeline import (
 
 
 class _FakeResponse:
-    def __init__(self, payload, status_code: int = 200) -> None:
+    def __init__(self, payload, status_code: int = 200, headers=None) -> None:
         self._payload = payload
         self.status_code = status_code
-        self.headers = {}
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -39,6 +41,108 @@ class _FakeSession:
     def get(self, url, params=None, timeout=60):
         cve_id = params.get("cve_id", "")
         return _FakeResponse(self.payloads_by_cve.get(cve_id, []))
+
+
+def _build_nvd_vulnerability(cve_id: str, severity: str = "HIGH", score: float = 8.1, last_modified: str = "2026-03-29T10:00:00.000Z"):
+    return {
+        "cve": {
+            "id": cve_id,
+            "published": "2026-03-28T10:00:00.000Z",
+            "lastModified": last_modified,
+            "descriptions": [{"lang": "en", "value": f"Description for {cve_id}"}],
+            "metrics": {
+                "cvssMetricV31": [
+                    {
+                        "cvssData": {
+                            "baseSeverity": severity,
+                            "baseScore": score,
+                        }
+                    }
+                ]
+            },
+        }
+    }
+
+
+def _build_github_advisory(
+    ghsa_id: str,
+    cve_id: str,
+    updated_at: str = "2026-03-29T12:00:00Z",
+    severity: str = "high",
+    score: float = 8.8,
+):
+    return {
+        "ghsa_id": ghsa_id,
+        "cve_id": cve_id,
+        "severity": severity,
+        "summary": f"Summary for {ghsa_id}",
+        "published_at": "2026-03-28T12:00:00Z",
+        "updated_at": updated_at,
+        "github_reviewed_at": updated_at,
+        "references": [f"https://github.com/advisories/{ghsa_id}"],
+        "cwes": [{"cwe_id": "CWE-79"}],
+        "vulnerabilities": [{"package": {"ecosystem": "pip", "name": "examplepkg"}}],
+        "cvss": {"score": score},
+        "epss": [{"percentage": 0.91, "percentile": "0.99"}],
+        "identifiers": [{"type": "GHSA", "value": ghsa_id}, {"type": "CVE", "value": cve_id}],
+    }
+
+
+class _FakeNvdSession:
+    def __init__(self, has_kev_pages=None, last_mod_pages=None, cve_payloads=None):
+        self.has_kev_pages = has_kev_pages or {}
+        self.last_mod_pages = last_mod_pages or {}
+        self.cve_payloads = cve_payloads or {}
+        self.headers = {}
+        self.calls = []
+
+    def get(self, url, params=None, timeout=60):
+        params = params or {}
+        self.calls.append((url, dict(params)))
+
+        if "cveId" in params:
+            cve_id = params["cveId"]
+            payload = self.cve_payloads.get(cve_id, {"resultsPerPage": 0, "startIndex": 0, "totalResults": 0, "vulnerabilities": []})
+            return _FakeResponse(payload)
+
+        if "lastModStartDate" in params:
+            start_index = int(params.get("startIndex", "0"))
+            payload = self.last_mod_pages.get(
+                start_index,
+                {"resultsPerPage": 0, "startIndex": start_index, "totalResults": 0, "vulnerabilities": []},
+            )
+            return _FakeResponse(payload)
+
+        if "?hasKev" in url:
+            start_index = int(params.get("startIndex", "0"))
+            payload = self.has_kev_pages.get(
+                start_index,
+                {"resultsPerPage": 0, "startIndex": start_index, "totalResults": 0, "vulnerabilities": []},
+            )
+            return _FakeResponse(payload)
+
+        return _FakeResponse({"resultsPerPage": 0, "startIndex": 0, "totalResults": 0, "vulnerabilities": []})
+
+
+class _FakeGithubSession:
+    def __init__(self, pages=None, cve_payloads=None):
+        self.pages = pages or {}
+        self.cve_payloads = cve_payloads or {}
+        self.headers = {}
+        self.calls = []
+
+    def get(self, url, params=None, timeout=60):
+        params = params or {}
+        self.calls.append((url, dict(params)))
+
+        if "cve_id" in params:
+            cve_id = params["cve_id"]
+            payload = self.cve_payloads.get(cve_id, [])
+            return _FakeResponse(payload)
+
+        after = params.get("after", "")
+        payload, headers = self.pages.get(after, ([], {}))
+        return _FakeResponse(payload, headers=headers)
 
 
 class ParseNotesTests(unittest.TestCase):
@@ -122,6 +226,36 @@ class DeltaTests(unittest.TestCase):
         self.assertEqual(result["counts"]["new_ransomware_today"], 1)
         self.assertTrue((self.tmpdir / "delta" / "new_cves_today.csv").exists())
 
+    def test_copy_outputs_to_snapshot_uses_hardlinks_for_data_files(self) -> None:
+        current_dir = self.tmpdir / "current"
+        snapshot_dir = self.tmpdir / "snapshot"
+        plots_dir = self.tmpdir / "plots"
+        current_dir.mkdir(parents=True, exist_ok=True)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        data_file = current_dir / "threats_daily_events.csv"
+        summary_file = current_dir / "summary.json"
+        plot_file = plots_dir / "01_threats_daily_timeline.html"
+        data_file.write_text("cve_id\nCVE-2026-0001\n", encoding="utf-8")
+        summary_file.write_text('{"ok": true}', encoding="utf-8")
+        plot_file.write_text("<html></html>", encoding="utf-8")
+
+        copied = _copy_outputs_to_snapshot(
+            files={"threats_daily_events": data_file, "summary": summary_file},
+            snapshot_dir=snapshot_dir,
+            plots_dir=plots_dir,
+            include_plots=True,
+        )
+
+        snapshot_data_file = snapshot_dir / "threats_daily_events.csv"
+        snapshot_summary_file = snapshot_dir / "summary.json"
+        snapshot_plot_file = snapshot_dir / "plots" / "01_threats_daily_timeline.html"
+
+        self.assertEqual(data_file.stat().st_ino, snapshot_data_file.stat().st_ino)
+        self.assertNotEqual(summary_file.stat().st_ino, snapshot_summary_file.stat().st_ino)
+        self.assertEqual(plot_file.stat().st_ino, snapshot_plot_file.stat().st_ino)
+        self.assertIn("plots_dir", copied)
+
 
 class ConfigTests(unittest.TestCase):
     def test_default_directories_are_isolated_under_artifacts(self) -> None:
@@ -130,7 +264,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.out_dir, Path("artifacts/current"))
         self.assertEqual(config.snapshots_dir, Path("artifacts/snapshots"))
         self.assertEqual(config.deltas_dir, Path("artifacts/deltas"))
+        self.assertEqual(config.nvd_cache_dir, Path("artifacts/nvd_cache"))
+        self.assertEqual(config.github_cache_dir, Path("artifacts/github_cache"))
         self.assertEqual(config.snapshot_plots_dir, Path("artifacts/snapshots") / config.snapshot_date.isoformat() / "plots")
+        self.assertEqual(config.nvd_cache_file, Path("artifacts/nvd_cache") / "nvd_cves.csv")
+        self.assertEqual(config.github_cache_file, Path("artifacts/github_cache") / "github_advisories.csv")
+        self.assertEqual(config.github_fallback_max_cves, 25)
 
     def test_kev_mode_disables_optional_github_advisories(self) -> None:
         config = PipelineConfig(pipeline_mode="kev", run_github_advisories=True)
@@ -138,57 +277,242 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.run_github_advisories)
 
 
+class NvdEnrichmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="kev-pipeline-nvd-tests-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmpdir)
+
+    def test_fetch_nvd_enrichment_builds_cache_from_has_kev_and_falls_back_for_missing_cves(self) -> None:
+        session = _FakeNvdSession(
+            has_kev_pages={
+                0: {
+                    "resultsPerPage": 2,
+                    "startIndex": 0,
+                    "totalResults": 2,
+                    "vulnerabilities": [
+                        _build_nvd_vulnerability("CVE-2026-0001"),
+                        _build_nvd_vulnerability("CVE-2026-0002"),
+                    ],
+                }
+            },
+            cve_payloads={
+                "CVE-2026-0003": {
+                    "resultsPerPage": 1,
+                    "startIndex": 0,
+                    "totalResults": 1,
+                    "vulnerabilities": [_build_nvd_vulnerability("CVE-2026-0003", severity="CRITICAL", score=9.8)],
+                }
+            },
+        )
+        config = PipelineConfig(
+            pipeline_mode="full",
+            run_nvd=True,
+            nvd_cache_dir=self.tmpdir / "nvd_cache",
+            nvd_delay_seconds=0,
+        )
+
+        df, failures = fetch_nvd_enrichment_for_cves(session, config, ["CVE-2026-0001", "CVE-2026-0003"])
+
+        self.assertEqual(set(df["cve_id"]), {"CVE-2026-0001", "CVE-2026-0003"})
+        self.assertEqual(failures, [])
+        cache_df = pd.read_csv(config.nvd_cache_file)
+        self.assertEqual(set(cache_df["cve_id"]), {"CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"})
+        self.assertTrue(any("?hasKev" in url for url, _ in session.calls))
+        self.assertTrue(any(params.get("cveId") == "CVE-2026-0003" for _, params in session.calls))
+
+    def test_fetch_nvd_enrichment_updates_cache_from_last_modified_window(self) -> None:
+        cache_dir = self.tmpdir / "nvd_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "cve_id": "CVE-2026-0001",
+                    "nvd_published": "2026-03-28T10:00:00.000Z",
+                    "nvd_last_modified": "2026-03-29T10:00:00.000Z",
+                    "nvd_severity": "MEDIUM",
+                    "nvd_cvss_score": 5.5,
+                    "nvd_description": "Old description",
+                }
+            ]
+        ).to_csv(cache_dir / "nvd_cves.csv", index=False)
+        (cache_dir / "nvd_sync_state.json").write_text('{"last_sync_utc": "2000-01-01T00:00:00+00:00"}', encoding="utf-8")
+
+        session = _FakeNvdSession(
+            last_mod_pages={
+                0: {
+                    "resultsPerPage": 1,
+                    "startIndex": 0,
+                    "totalResults": 1,
+                    "vulnerabilities": [
+                        _build_nvd_vulnerability(
+                            "CVE-2026-0001",
+                            severity="HIGH",
+                            score=8.8,
+                            last_modified="2026-03-30T10:00:00.000Z",
+                        )
+                    ],
+                }
+            },
+            has_kev_pages={
+                0: {
+                    "resultsPerPage": 1,
+                    "startIndex": 0,
+                    "totalResults": 1,
+                    "vulnerabilities": [
+                        _build_nvd_vulnerability(
+                            "CVE-2026-0001",
+                            severity="HIGH",
+                            score=8.8,
+                            last_modified="2026-03-30T10:00:00.000Z",
+                        )
+                    ],
+                }
+            },
+        )
+        config = PipelineConfig(
+            pipeline_mode="full",
+            run_nvd=True,
+            nvd_cache_dir=cache_dir,
+            nvd_delay_seconds=0,
+        )
+
+        df, failures = fetch_nvd_enrichment_for_cves(session, config, ["CVE-2026-0001"])
+
+        self.assertEqual(failures, [])
+        self.assertEqual(df.loc[0, "nvd_severity"], "HIGH")
+        self.assertEqual(float(df.loc[0, "nvd_cvss_score"]), 8.8)
+        self.assertTrue(any("lastModStartDate" in params for _, params in session.calls))
+
+
 class GitHubAdvisoriesTests(unittest.TestCase):
-    def test_fetch_github_advisories_aggregates_multiple_results_by_cve(self) -> None:
-        payloads_by_cve = {
-            "CVE-2026-0001": [
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="kev-pipeline-ghsa-tests-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmpdir)
+
+    def test_fetch_github_advisories_paginates_and_caches_by_ghsa(self) -> None:
+        session = _FakeGithubSession(
+            pages={
+                "": (
+                    [
+                        _build_github_advisory("GHSA-aaaa-bbbb-cccc", "CVE-2026-0001", updated_at="2026-03-30T12:00:00Z"),
+                    ],
+                    {"Link": '<https://api.github.com/advisories?after=cursor-2>; rel="next"'},
+                ),
+                "cursor-2": (
+                    [
+                        _build_github_advisory("GHSA-dddd-eeee-ffff", "CVE-2026-0001", updated_at="2026-03-30T11:00:00Z", severity="critical", score=9.7),
+                        _build_github_advisory("GHSA-gggg-hhhh-iiii", "CVE-2026-0002", updated_at="2026-03-30T10:00:00Z"),
+                    ],
+                    {},
+                ),
+            }
+        )
+        config = PipelineConfig(
+            pipeline_mode="full",
+            run_github_advisories=True,
+            github_cache_dir=self.tmpdir / "github_cache",
+            github_delay_seconds=0,
+        )
+
+        df, failures = fetch_github_advisories_for_cves(session, config, ["CVE-2026-0001", "CVE-2026-0002"])
+
+        self.assertEqual(failures, [])
+        self.assertEqual(set(df["cve_id"]), {"CVE-2026-0001", "CVE-2026-0002"})
+        first_row = df[df["cve_id"] == "CVE-2026-0001"].iloc[0]
+        self.assertEqual(int(first_row["ghsa_advisory_count"]), 2)
+        self.assertEqual(float(first_row["ghsa_cvss_score_max"]), 9.7)
+        self.assertIn("GHSA-aaaa-bbbb-cccc", first_row["ghsa_ids"])
+        self.assertIn("GHSA-dddd-eeee-ffff", first_row["ghsa_ids"])
+        cache_df = pd.read_csv(config.github_cache_file)
+        self.assertEqual(set(cache_df["ghsa_id"]), {"GHSA-aaaa-bbbb-cccc", "GHSA-dddd-eeee-ffff", "GHSA-gggg-hhhh-iiii"})
+        self.assertTrue(config.github_sync_state_file.exists())
+
+    def test_fetch_github_advisories_updates_cache_and_falls_back_for_missing_cves(self) -> None:
+        cache_dir = self.tmpdir / "github_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
                 {
                     "ghsa_id": "GHSA-aaaa-bbbb-cccc",
                     "cve_id": "CVE-2026-0001",
-                    "severity": "high",
-                    "summary": "First advisory",
-                    "published_at": "2026-03-29T10:00:00Z",
-                    "updated_at": "2026-03-29T10:30:00Z",
-                    "github_reviewed_at": "2026-03-29T11:00:00Z",
-                    "references": ["https://github.com/advisories/GHSA-aaaa-bbbb-cccc"],
-                    "cwes": [{"cwe_id": "CWE-79"}],
-                    "vulnerabilities": [
-                        {"package": {"ecosystem": "pip", "name": "examplepkg"}},
-                    ],
-                    "cvss": {"score": 8.8},
-                    "epss": [{"percentage": 0.91, "percentile": "0.99"}],
-                },
-                {
-                    "ghsa_id": "GHSA-dddd-eeee-ffff",
-                    "cve_id": "CVE-2026-0001",
-                    "severity": "critical",
-                    "summary": "Second advisory",
-                    "published_at": "2026-03-29T12:00:00Z",
-                    "updated_at": "2026-03-29T12:30:00Z",
-                    "references": ["https://nvd.nist.gov/vuln/detail/CVE-2026-0001"],
-                    "cwes": [{"cwe_id": "CWE-89"}],
-                    "vulnerabilities": [
-                        {"package": {"ecosystem": "npm", "name": "example-js"}},
-                    ],
-                    "cvss_severities": {"cvss_v4": {"score": 9.7}},
-                },
+                    "ghsa_modified_at": "2026-03-29T10:00:00Z",
+                    "ghsa_severity": "medium",
+                    "ghsa_summary": "Old summary",
+                    "ghsa_published_at": "2026-03-28T12:00:00Z",
+                    "ghsa_updated_at": "2026-03-29T10:00:00Z",
+                    "ghsa_reviewed_at": "2026-03-29T10:00:00Z",
+                    "ghsa_withdrawn_at": "",
+                    "ghsa_cvss_score": 5.5,
+                    "ghsa_cwes": "CWE-79",
+                    "ghsa_ecosystems": "pip",
+                    "ghsa_packages": "examplepkg",
+                    "ghsa_reference_urls": "https://github.com/advisories/GHSA-aaaa-bbbb-cccc",
+                    "ghsa_epss_percentages": "0.50",
+                    "ghsa_epss_percentiles": "0.60",
+                }
             ]
-        }
-        session = _FakeSession(payloads_by_cve)
-        config = PipelineConfig(pipeline_mode="full", run_github_advisories=True, github_delay_seconds=0)
+        ).to_csv(cache_dir / "github_advisories.csv", index=False)
+        (cache_dir / "github_sync_state.json").write_text('{"last_sync_utc": "2026-03-30T11:30:00+00:00"}', encoding="utf-8")
 
-        df, failures = fetch_github_advisories_for_cves(session, config, ["CVE-2026-0001"])
+        session = _FakeGithubSession(
+            pages={
+                "": (
+                    [
+                        _build_github_advisory("GHSA-aaaa-bbbb-cccc", "CVE-2026-0001", updated_at="2026-03-30T12:00:00Z", severity="high", score=8.8),
+                        _build_github_advisory("GHSA-zzzz-yyyy-xxxx", "CVE-2026-9999", updated_at="2026-03-30T11:00:00Z"),
+                    ],
+                    {},
+                )
+            },
+            cve_payloads={
+                "CVE-2026-0002": [_build_github_advisory("GHSA-jjjj-kkkk-llll", "CVE-2026-0002", updated_at="2026-03-29T09:00:00Z")]
+            },
+        )
+        config = PipelineConfig(
+            pipeline_mode="full",
+            run_github_advisories=True,
+            github_cache_dir=cache_dir,
+            github_delay_seconds=0,
+        )
+
+        df, failures = fetch_github_advisories_for_cves(session, config, ["CVE-2026-0001", "CVE-2026-0002"])
 
         self.assertEqual(failures, [])
-        self.assertEqual(list(df["cve_id"]), ["CVE-2026-0001"])
-        self.assertEqual(int(df.loc[0, "ghsa_advisory_count"]), 2)
-        self.assertEqual(float(df.loc[0, "ghsa_cvss_score_max"]), 9.7)
-        self.assertIn("GHSA-aaaa-bbbb-cccc", df.loc[0, "ghsa_ids"])
-        self.assertIn("GHSA-dddd-eeee-ffff", df.loc[0, "ghsa_ids"])
-        self.assertIn("CWE-79", df.loc[0, "ghsa_cwes"])
-        self.assertIn("CWE-89", df.loc[0, "ghsa_cwes"])
-        self.assertIn("pip", df.loc[0, "ghsa_ecosystems"])
-        self.assertIn("npm", df.loc[0, "ghsa_ecosystems"])
+        row_one = df[df["cve_id"] == "CVE-2026-0001"].iloc[0]
+        self.assertEqual(row_one["ghsa_severities"], "high")
+        self.assertEqual(float(row_one["ghsa_cvss_score_max"]), 8.8)
+        self.assertTrue(any(params.get("cve_id") == "CVE-2026-0002" for _, params in session.calls))
+
+    def test_fetch_github_advisories_skips_large_direct_fallback(self) -> None:
+        session = _FakeGithubSession(
+            pages={
+                "": (
+                    [_build_github_advisory("GHSA-aaaa-bbbb-cccc", "CVE-2026-0001", updated_at="2026-03-30T12:00:00Z")],
+                    {},
+                )
+            }
+        )
+        config = PipelineConfig(
+            pipeline_mode="full",
+            run_github_advisories=True,
+            github_cache_dir=self.tmpdir / "github_cache_skip",
+            github_delay_seconds=0,
+            github_fallback_max_cves=1,
+        )
+
+        df, failures = fetch_github_advisories_for_cves(
+            session,
+            config,
+            ["CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"],
+        )
+
+        self.assertEqual(set(df["cve_id"]), {"CVE-2026-0001"})
+        self.assertTrue(any("Skipped direct GitHub advisory fallback" in item["error"] for item in failures))
+        self.assertFalse(any("cve_id" in params for _, params in session.calls))
 
 
 class RunPipelineTests(unittest.TestCase):
