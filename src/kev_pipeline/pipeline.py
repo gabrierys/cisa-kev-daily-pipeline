@@ -410,16 +410,165 @@ def fetch_epss_for_cves(
     return pd.DataFrame(rows), failures
 
 
+def _join_unique_text(values: Iterable[object], separator: str = " | ") -> str:
+    seen: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return separator.join(seen)
+
+
+def _extract_github_cvss_score(advisory: Dict[str, object]) -> Optional[float]:
+    cvss = advisory.get("cvss", {})
+    if isinstance(cvss, dict):
+        score = cvss.get("score")
+        if isinstance(score, (int, float)):
+            return float(score)
+
+    cvss_severities = advisory.get("cvss_severities", {})
+    if isinstance(cvss_severities, dict):
+        for key in ["cvss_v4", "cvss_v3"]:
+            metric = cvss_severities.get(key, {})
+            if isinstance(metric, dict):
+                score = metric.get("score")
+                if isinstance(score, (int, float)):
+                    return float(score)
+    return None
+
+
+def fetch_github_advisories_for_cves(
+    session: requests.Session,
+    config: PipelineConfig,
+    cve_ids: Sequence[str],
+) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
+    rows: List[Dict[str, object]] = []
+    failures: List[Dict[str, str]] = []
+    seen_cves = sorted(set(cve_ids))
+
+    session.headers.update(
+        {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": config.github_api_version,
+        }
+    )
+
+    for cve_id in seen_cves:
+        try:
+            response = _request_with_retry(
+                session=session,
+                url=config.github_advisories_api_url,
+                params={"cve_id": cve_id, "per_page": "100"},
+                timeout=45,
+                max_retries=3,
+            )
+            advisories = response.json()
+            if not isinstance(advisories, list):
+                failures.append(
+                    {
+                        "source": "github_advisories",
+                        "item": cve_id,
+                        "error": "Unexpected response shape from GitHub advisories API",
+                    }
+                )
+                continue
+            advisories = [advisory for advisory in advisories if isinstance(advisory, dict)]
+            if not advisories:
+                continue
+
+            references: List[str] = []
+            cwes: List[str] = []
+            ecosystems: List[str] = []
+            packages: List[str] = []
+            epss_percentages: List[str] = []
+            epss_percentiles: List[str] = []
+            cvss_scores: List[float] = []
+
+            for advisory in advisories:
+                references.extend(
+                    reference
+                    for reference in advisory.get("references", [])
+                    if isinstance(reference, str) and reference.strip()
+                )
+                for cwe in advisory.get("cwes", []):
+                    if isinstance(cwe, dict):
+                        cwes.append(cwe.get("cwe_id", ""))
+
+                for epss_item in advisory.get("epss", []):
+                    if isinstance(epss_item, dict):
+                        percentage = epss_item.get("percentage")
+                        percentile = epss_item.get("percentile")
+                        if percentage not in [None, ""]:
+                            epss_percentages.append(str(percentage))
+                        if percentile not in [None, ""]:
+                            epss_percentiles.append(str(percentile))
+
+                vulnerabilities = advisory.get("vulnerabilities", [])
+                if not isinstance(vulnerabilities, list):
+                    continue
+                for item in vulnerabilities:
+                    if not isinstance(item, dict):
+                        continue
+                    package = item.get("package", {})
+                    if not isinstance(package, dict):
+                        continue
+                    ecosystem = str(package.get("ecosystem", "")).strip()
+                    package_name = str(package.get("name", "")).strip()
+                    if ecosystem:
+                        ecosystems.append(ecosystem)
+                    if package_name:
+                        packages.append(package_name)
+
+                cvss_score = _extract_github_cvss_score(advisory)
+                if cvss_score is not None:
+                    cvss_scores.append(cvss_score)
+
+            rows.append(
+                {
+                    "cve_id": cve_id,
+                    "ghsa_advisory_count": len(advisories),
+                    "ghsa_ids": _join_unique_text(advisory.get("ghsa_id", "") for advisory in advisories),
+                    "ghsa_severities": _join_unique_text(advisory.get("severity", "") for advisory in advisories),
+                    "ghsa_summaries": _join_unique_text(advisory.get("summary", "") for advisory in advisories),
+                    "ghsa_published_at": _join_unique_text(
+                        sorted(advisory.get("published_at", "") for advisory in advisories)
+                    ),
+                    "ghsa_updated_at": _join_unique_text(
+                        sorted(advisory.get("updated_at", "") for advisory in advisories)
+                    ),
+                    "ghsa_reviewed_at": _join_unique_text(
+                        sorted(advisory.get("github_reviewed_at", "") for advisory in advisories)
+                    ),
+                    "ghsa_has_withdrawn": any(bool(advisory.get("withdrawn_at")) for advisory in advisories),
+                    "ghsa_cvss_score_max": max(cvss_scores) if cvss_scores else None,
+                    "ghsa_cwes": _join_unique_text(cwes),
+                    "ghsa_ecosystems": _join_unique_text(ecosystems),
+                    "ghsa_packages": _join_unique_text(packages),
+                    "ghsa_reference_urls": _join_unique_text(references),
+                    "ghsa_epss_percentages": _join_unique_text(epss_percentages),
+                    "ghsa_epss_percentiles": _join_unique_text(epss_percentiles),
+                }
+            )
+        except Exception as exc:
+            failures.append({"source": "github_advisories", "item": cve_id, "error": str(exc)})
+        time.sleep(config.github_delay_seconds)
+
+    return pd.DataFrame(rows), failures
+
+
 def build_enriched_events(
     events_df: pd.DataFrame,
     nvd_df: Optional[pd.DataFrame] = None,
     epss_df: Optional[pd.DataFrame] = None,
+    github_advisories_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     enriched = events_df.copy()
     if nvd_df is not None and not nvd_df.empty:
         enriched = enriched.merge(nvd_df, on="cve_id", how="left")
     if epss_df is not None and not epss_df.empty:
         enriched = enriched.merge(epss_df, on="cve_id", how="left")
+    if github_advisories_df is not None and not github_advisories_df.empty:
+        enriched = enriched.merge(github_advisories_df, on="cve_id", how="left")
     return enriched
 
 
@@ -682,12 +831,29 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
         execution_warnings.append(epss_warning)
     enrichment_failures.extend(epss_failures)
 
+    enrich_github_advisories_df, github_warning, github_failures = _run_optional_enrichment(
+        enabled=config.pipeline_mode == "full" and config.run_github_advisories,
+        label="GitHub advisories",
+        fetch_fn=lambda: fetch_github_advisories_for_cves(
+            session=session,
+            config=config,
+            cve_ids=threats_daily_events_df["cve_id"].tolist(),
+        ),
+        output_path=files["enrich_github_advisories"],
+        disabled_warning="GitHub advisories disabled.",
+        empty_warning="GitHub advisories enabled, but returned no data.",
+    )
+    if github_warning:
+        execution_warnings.append(github_warning)
+    enrichment_failures.extend(github_failures)
+
     threats_daily_enriched_df = pd.DataFrame()
-    if any(not df.empty for df in [enrich_nvd_df, enrich_epss_df]):
+    if any(not df.empty for df in [enrich_nvd_df, enrich_epss_df, enrich_github_advisories_df]):
         threats_daily_enriched_df = build_enriched_events(
             threats_daily_events_df,
             nvd_df=enrich_nvd_df,
             epss_df=enrich_epss_df,
+            github_advisories_df=enrich_github_advisories_df,
         )
         save_csv(threats_daily_enriched_df, files["threats_daily_enriched"])
 
@@ -712,6 +878,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
         "pipeline_mode": config.pipeline_mode,
         "run_nvd": config.run_nvd,
         "run_epss": config.run_epss,
+        "run_github_advisories": config.run_github_advisories,
         "snapshot_date": config.snapshot_date.isoformat(),
         "rows": {
             "kev_raw": int(len(kev_raw_df)),
@@ -721,6 +888,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, object]:
             "threats_by_product": int(len(threats_by_product_df)),
             "enrich_nvd": int(len(enrich_nvd_df)),
             "enrich_epss": int(len(enrich_epss_df)),
+            "enrich_github_advisories": int(len(enrich_github_advisories_df)),
             "threats_daily_enriched": int(len(threats_daily_enriched_df)),
         },
         "metrics": _date_metrics(threats_daily_events_df),
