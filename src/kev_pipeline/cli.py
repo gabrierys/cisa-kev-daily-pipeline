@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
 from .config import PipelineConfig
+from .env import load_dotenv
 from .pipeline import run_pipeline
 
 
@@ -41,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    load_dotenv()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -52,8 +55,8 @@ def main() -> int:
         out_dir=Path(args.out_dir),
         snapshots_dir=Path(args.snapshots_dir),
         deltas_dir=Path(args.deltas_dir),
-        nvd_api_key=args.nvd_api_key,
-        github_token=args.github_token,
+        nvd_api_key=args.nvd_api_key or os.getenv("NVD_API_KEY", ""),
+        github_token=args.github_token or os.getenv("GITHUB_TOKEN", ""),
         nvd_max_items=args.nvd_max_items,
         github_fallback_max_cves=args.github_fallback_max_cves,
         generate_plots=not args.skip_plots,
