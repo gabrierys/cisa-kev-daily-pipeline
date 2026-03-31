@@ -29,6 +29,9 @@ def serialize_path(path: Path, base_dir: Optional[Path] = None) -> str:
 
 
 def link_or_copy_file(source: Path, destination: Path, allow_hardlink: bool = True) -> None:
+    if source.resolve(strict=False) == destination.resolve(strict=False):
+        return
+
     if destination.exists():
         destination.unlink()
 
