@@ -18,6 +18,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["kev", "full"], default="kev", help="Pipeline execution mode.")
     parser.add_argument("--run-nvd", action="store_true", help="Enable optional NVD enrichment.")
     parser.add_argument("--run-epss", action="store_true", help="Enable optional EPSS enrichment.")
+    parser.add_argument(
+        "--run-github-advisories",
+        action="store_true",
+        help="Enable optional GitHub Security Advisories enrichment.",
+    )
     parser.add_argument("--nvd-api-key", default="", help="Optional NVD API key.")
     parser.add_argument("--out-dir", default="artifacts/current", help="Directory for canonical output files.")
     parser.add_argument("--snapshots-dir", default="artifacts/snapshots", help="Directory for dated snapshots.")
@@ -36,6 +41,7 @@ def main() -> int:
         pipeline_mode=args.mode,
         run_nvd=args.run_nvd,
         run_epss=args.run_epss,
+        run_github_advisories=args.run_github_advisories,
         out_dir=Path(args.out_dir),
         snapshots_dir=Path(args.snapshots_dir),
         deltas_dir=Path(args.deltas_dir),
