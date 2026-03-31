@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from kev_pipeline.common import serialize_path
 from kev_pipeline.pipeline import _copy_outputs_to_snapshot, build_delta_outputs
 
 
@@ -76,6 +78,17 @@ class DeltaTests(unittest.TestCase):
         self.assertNotEqual(summary_file.stat().st_ino, snapshot_summary_file.stat().st_ino)
         self.assertEqual(plot_file.stat().st_ino, snapshot_plot_file.stat().st_ino)
         self.assertIn("plots_dir", copied)
+
+    def test_serialize_path_relativizes_paths_inside_working_directory(self) -> None:
+        previous_cwd = Path.cwd()
+        os.chdir(self.tmpdir)
+        self.addCleanup(os.chdir, previous_cwd)
+
+        nested = self.tmpdir / "artifacts" / "current" / "summary.json"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_text("{}", encoding="utf-8")
+
+        self.assertEqual(serialize_path(nested), "artifacts/current/summary.json")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -143,6 +144,49 @@ class RunPipelineTests(unittest.TestCase):
         self.assertTrue(summary["run_github_advisories"])
         self.assertEqual(summary["rows"]["enrich_github_advisories"], 1)
         self.assertIn("enrich_github_advisories", summary["files"])
+
+    def test_summary_uses_relative_paths_even_with_absolute_config(self) -> None:
+        previous_cwd = Path.cwd()
+        os.chdir(self.tmpdir)
+        self.addCleanup(os.chdir, previous_cwd)
+
+        out_dir = (self.tmpdir / "artifacts" / "current").resolve()
+        snapshots_dir = (self.tmpdir / "artifacts" / "snapshots").resolve()
+        deltas_dir = (self.tmpdir / "artifacts" / "deltas").resolve()
+        snapshot_date = "2026-03-30"
+
+        raw_df = pd.DataFrame(
+            [
+                {
+                    "dateAdded": "2026-03-27",
+                    "cveID": "CVE-2026-0001",
+                    "vendorProject": "Example",
+                    "product": "Widget",
+                    "dueDate": "2026-04-10",
+                    "knownRansomwareCampaignUse": "Known",
+                    "notes": "Patch available",
+                }
+            ]
+        )
+
+        config = PipelineConfig(
+            pipeline_mode="kev",
+            run_nvd=False,
+            run_epss=False,
+            out_dir=out_dir,
+            snapshots_dir=snapshots_dir,
+            deltas_dir=deltas_dir,
+            generate_plots=False,
+            snapshot_date=pd.to_datetime(snapshot_date).date(),
+        )
+
+        with patch("kev_pipeline.pipeline.download_kev_raw_df", return_value=raw_df):
+            summary = run_pipeline(config)
+
+        self.assertEqual(summary["files"]["summary"], "artifacts/current/summary.json")
+        self.assertEqual(summary["files"]["snapshot_dir"], "artifacts/snapshots/2026-03-30")
+        self.assertEqual(summary["files"]["delta_dir"], "artifacts/deltas/2026-03-30")
+        self.assertEqual(summary["delta"]["files"]["new_cves_today"], "artifacts/deltas/2026-03-30/new_cves_today.csv")
 
 
 if __name__ == "__main__":
