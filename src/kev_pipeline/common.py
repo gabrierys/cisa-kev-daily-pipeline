@@ -68,7 +68,7 @@ def request_with_retry(
             response = session.get(url, params=params, timeout=timeout)
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                wait_s = float(retry_after) if retry_after else min(30, base_delay * (2 ** attempt))
+                wait_s = float(retry_after) if retry_after else max(30.0, base_delay * (2 ** attempt))
                 time.sleep(wait_s)
                 continue
             response.raise_for_status()
