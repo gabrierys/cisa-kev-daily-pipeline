@@ -199,6 +199,9 @@ def _fetch_nvd_by_cve_ids(
 ) -> Tuple[pd.DataFrame, List[Dict[str, str]]]:
     frames: List[pd.DataFrame] = []
     failures: List[Dict[str, str]] = []
+    # Without an API key the NVD public rate limit is 5 req/30 s (~6 s apart).
+    # With a key the limit is 50 req/30 s, so the configured delay is fine.
+    per_request_delay = config.nvd_delay_seconds if config.nvd_api_key else max(config.nvd_delay_seconds, 6.0)
     for cve_id in sorted(set(cve_ids)):
         try:
             response = request_with_retry(
@@ -216,7 +219,7 @@ def _fetch_nvd_by_cve_ids(
             frames.append(page_df)
         except Exception as exc:
             failures.append({"source": "nvd", "item": cve_id, "error": str(exc)})
-        time.sleep(config.nvd_delay_seconds)
+        time.sleep(per_request_delay)
 
     if not frames:
         return _empty_nvd_enrichment_df(), failures
